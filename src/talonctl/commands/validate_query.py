@@ -102,7 +102,12 @@ def validate_query(ctx, query, query_file, template):
         if result["valid"]:
             console.print("VALID")
         else:
-            console.print(f"INVALID: {result['message']}")
+            # LogScale diagnostics carry caret markers ("^") aligned under the
+            # offending column, and CQL bodies are full of square brackets.
+            # markup=False stops rich parsing "[...]" as a style tag; soft_wrap
+            # stops it wrapping or cropping the line the caret is aligned to.
+            # Both are required for the message to remain readable.
+            console.print(f"INVALID: {result['message']}", markup=False, highlight=False, soft_wrap=True)
             raise SystemExit(1)
 
     except SystemExit:

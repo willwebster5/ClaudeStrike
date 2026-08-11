@@ -328,14 +328,65 @@ class NGSIEMClient:
 
         return results
 
+    def _raw_syntax_error(self, query: str) -> Optional[str]:
+        """
+        Re-issue a rejected query outside the SDK to recover LogScale's diagnostic.
+
+        LogScale returns genuinely useful syntax errors — named error codes, the
+        offending line, and a caret under the exact column — but serves them as
+        ``text/plain``. falconpy only parses ``application/json``; on a JSONDecodeError
+        it assumes the body was empty (``_util/_functions.py``, "No response content,
+        but a successful request was made") and raises NoContentWarning WITHOUT ever
+        reading ``response.text``. The caller then receives a fabricated
+        ``{"errors": [{"message": "No content was received for this request."}]}``,
+        which is the opposite of what happened and sends authors looking at
+        connectivity instead of at their query.
+
+        There is no SDK path to the raw body, so we repeat the request with the
+        session falconpy already authenticated — its token and resolved base URL —
+        and read the text ourselves. No second OAuth round trip, no duplicated
+        credential handling.
+
+        Returns the diagnostic text, or None if it could not be recovered (in which
+        case the caller falls back to the status-only message).
+        """
+        try:
+            import requests
+
+            auth = getattr(self.client, "auth_object", None)
+            token = getattr(auth, "token_value", None)
+            base_url = getattr(auth, "base_url", None)
+            if not token or not base_url:
+                return None
+
+            resp = requests.post(
+                f"{base_url}/humio/api/v1/repositories/search-all/queryjobs",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"queryString": query, "start": "1m", "isLive": False},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                # Raced with a transient failure — the query parses after all.
+                return None
+
+            detail = (resp.text or "").strip()
+            # LogScale wraps the diagnostic in a ``` fence; unwrap so the caret
+            # alignment survives without a stray code fence in terminal output.
+            if detail.startswith("```") and detail.endswith("```"):
+                detail = detail[3:-3].strip("\n")
+            return detail or None
+
+        except Exception as exc:  # noqa: BLE001 - diagnostics are best-effort
+            logger.debug(f"Could not recover raw LogScale diagnostic: {exc}")
+            return None
+
     def test_query_syntax(self, query: str) -> Dict[str, Any]:
         """
         Test query syntax without executing full search.
 
-        The upstream parse endpoint returns a generic rejection without
-        structured detail. We pass any body.errors payload through verbatim
-        and include the HTTP status so authors know what the API actually
-        told us — rather than a misleading 'Unknown error' fallback.
+        On rejection we surface LogScale's own diagnostic verbatim when we can
+        recover it (see _raw_syntax_error), degrading to the SDK's payload and
+        then to a status-only message.
         """
         try:
             test_query = query.strip()
@@ -348,12 +399,21 @@ class NGSIEMClient:
             if search_id:
                 self._cleanup_search(search_id, "search-all")
 
-            if response.get("status_code") == 200:
+            status = response.get("status_code")
+            if status == 200:
                 return {"valid": True, "message": "Query syntax is valid"}
 
-            body = response.get("body") or {}
-            errors = body.get("errors")
-            status = response.get("status_code")
+            # Best case: LogScale's own linter output, with caret positions.
+            detail = self._raw_syntax_error(test_query)
+            if detail:
+                return {"valid": False, "message": f"LogScale rejected query (status={status}):\n{detail}"}
+
+            # NGSIEM.start_search() renames the payload key: it pops "body" and
+            # re-exposes it as "resources" (falconpy/ngsiem.py). Other service
+            # classes keep "body", and the Uber class does not rename at all, so
+            # check both rather than assuming either.
+            payload = response.get("resources") or response.get("body") or {}
+            errors = payload.get("errors") if isinstance(payload, dict) else None
 
             if errors:
                 detail = errors if isinstance(errors, str) else repr(errors)
