@@ -366,7 +366,15 @@ class NGSIEMClient:
                 timeout=30,
             )
             if resp.status_code == 200:
-                # Raced with a transient failure — the query parses after all.
+                # Raced with a transient failure — the query parses after all. We have
+                # just created a real query job, so stop it rather than orphaning it;
+                # the primary path cleans up after itself and this must too.
+                try:
+                    job_id = (resp.json() or {}).get("id")
+                except ValueError:
+                    job_id = None
+                if job_id:
+                    self._cleanup_search(job_id, "search-all")
                 return None
 
             detail = (resp.text or "").strip()

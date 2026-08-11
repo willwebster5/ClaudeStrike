@@ -138,3 +138,31 @@ def test_raw_recovery_never_raises_on_transport_failure():
         result = client.test_query_syntax("bad |")
     assert result["valid"] is False
     assert "no detail returned by API" in result["message"]
+
+
+def test_raw_recovery_cleans_up_the_job_it_creates_on_race():
+    """If the bypass unexpectedly succeeds it has created a real query job.
+
+    The primary path stops the job it starts; this path must too, or a transient
+    failure silently orphans a LogScale query job.
+    """
+    client = _client_with_mock_falconpy({"status_code": 400, "resources": {}})
+    ok = MagicMock(status_code=200)
+    ok.json.return_value = {"id": "raced-job-1", "hashedQueryOnView": "abc"}
+
+    with patch("requests.post", return_value=ok):
+        assert client._raw_syntax_error("| limit 1") is None
+
+    client._client.stop_search.assert_called_once_with(repository="search-all", id="raced-job-1")
+
+
+def test_raw_recovery_race_without_parseable_id_does_not_raise():
+    """A 200 with an unparseable body must not blow up the verdict path."""
+    client = _client_with_mock_falconpy({"status_code": 400, "resources": {}})
+    ok = MagicMock(status_code=200)
+    ok.json.side_effect = ValueError("not json")
+
+    with patch("requests.post", return_value=ok):
+        assert client._raw_syntax_error("| limit 1") is None
+
+    client._client.stop_search.assert_not_called()
