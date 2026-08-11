@@ -29,7 +29,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pre-commit>=3.7", "pytest>=7.0.0", "ruff>=0.8.0"]
+dev = [
+    "pre-commit>=3.7",
+    "pytest>=7.0.0",
+    # Upper bound is deliberate. ruff 0.16 widened the default rule set and
+    # changed formatter output, so CI (which installs the newest match) went from
+    # green to 1,378 lint errors and 2 files needing reformatting on master —
+    # without a single source change. An unpinned linter means CI breakage arrives
+    # on an upstream release schedule rather than on a commit, and lands on
+    # whichever PR is open at the time.
+    #
+    # Verified 2026-08-11: master is clean under 0.15.13 and fails under 0.16.2.
+    # Adopting 0.16 is a real migration (~1,378 findings, mostly import ordering
+    # and Optional[X] -> X | None) and belongs in its own PR, not smuggled into an
+    # unrelated one. Raise this bound as part of that work.
+    "ruff>=0.8.0,<0.16",
+]
 
 [project.scripts]
 talonctl = "talonctl.cli:cli"
