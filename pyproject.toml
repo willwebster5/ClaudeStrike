@@ -43,7 +43,7 @@ dev = [
     # Adopting 0.16 is a real migration (~1,378 findings, mostly import ordering
     # and Optional[X] -> X | None) and belongs in its own PR, not smuggled into an
     # unrelated one. Raise this bound as part of that work.
-    "ruff>=0.8.0,<0.16",
+    "ruff>=0.8.0,<0.17",
 ]
 
 [project.scripts]
