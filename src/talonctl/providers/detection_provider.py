@@ -8,6 +8,7 @@ CrowdStrike NGSIEM detection rules as Infrastructure as Code resources.
 import json
 import hashlib
 import logging
+import time
 from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING
 from datetime import datetime, timezone
 
@@ -21,6 +22,10 @@ from talonctl.core.template_sanitizer import strip_for_api, strip_for_hash
 from talonctl.utils.mitre_processor import MitreProcessor
 
 logger = logging.getLogger(__name__)
+
+# Backoff schedule (seconds) for post-apply read-back verification. The API is
+# eventually consistent, so a write may not be visible on the first re-read.
+VERIFY_BACKOFF = [0.5, 1, 2, 4]
 
 
 class DetectionProvider(BaseResourceProvider):
@@ -48,6 +53,9 @@ class DetectionProvider(BaseResourceProvider):
         self.timeout = self.config.get("timeout", 30)
         self._remote_rules_cache: Optional[Dict[str, Dict[str, Any]]] = None
         self._remote_rules_raw_cache: Optional[Dict[str, Dict[str, Any]]] = None
+        # Complete raw index keyed by rule_id. Rule names are NOT unique in
+        # CrowdStrike, so the name-keyed caches above lose every duplicate.
+        self._remote_rules_by_id: Optional[Dict[str, Dict[str, Any]]] = None
 
         # Extract customer_id from credentials if available
         creds = self.config.get("credentials", {})
@@ -294,10 +302,12 @@ class DetectionProvider(BaseResourceProvider):
             if self._remote_rules_cache is None:
                 self._fetch_all_remote_rules()
 
-            # Search for rule by rule_id
-            for rule_name, rule_data in (self._remote_rules_cache or {}).items():
-                if rule_data.get("rule_id") == resource_id:
-                    return rule_data
+            # Resolve against the complete rule_id index. The name index is lossy:
+            # rules sharing a name overwrite each other, which previously made
+            # collapsed rules invisible and sent lookups to the wrong object.
+            raw = (self._remote_rules_by_id or {}).get(resource_id)
+            if raw is not None:
+                return self._normalize_rule(raw)
 
             # If not found in cache, try direct fetch
             response = self.falcon.command("entities_rules_get_v1", ids=[resource_id])
@@ -321,6 +331,8 @@ class DetectionProvider(BaseResourceProvider):
         try:
             all_rules = {}
             all_rules_raw = {}
+            all_rules_by_id = {}
+            duplicate_names = {}
             offset = 0
             limit = 1000  # API max per page
             total_fetched = 0
@@ -337,10 +349,18 @@ class DetectionProvider(BaseResourceProvider):
                 if not rules:
                     break  # No more rules to fetch
 
-                # Index by name for easy lookup
+                # Index by rule_id (complete) and by name (lossy — names are not
+                # unique in CrowdStrike, so the name index keeps only the last rule
+                # of each name and MUST NOT be used to resolve an ID).
                 for rule in rules:
+                    rule_id = rule.get("rule_id") or rule.get("id")
+                    if rule_id:
+                        all_rules_by_id[rule_id] = rule
+
                     rule_name = rule.get("name", "")
                     if rule_name:
+                        if rule_name in all_rules_raw:
+                            duplicate_names[rule_name] = duplicate_names.get(rule_name, 1) + 1
                         all_rules_raw[rule_name] = rule
                         all_rules[rule_name] = self._normalize_rule(rule)
 
@@ -360,16 +380,40 @@ class DetectionProvider(BaseResourceProvider):
                 if len(rules) < limit:
                     break
 
-            logger.info(f"Cached {len(all_rules)} rules from CrowdStrike (fetched {total_fetched} total)")
+            logger.info(
+                f"Cached {len(all_rules)} rules by name, {len(all_rules_by_id)} by ID "
+                f"from CrowdStrike (fetched {total_fetched} total)"
+            )
+            if duplicate_names:
+                shared = sum(duplicate_names.values())
+                worst = sorted(duplicate_names.items(), key=lambda kv: -kv[1])[:5]
+                logger.warning(
+                    f"{len(duplicate_names)} rule name(s) are shared by {shared} rules in this tenant. "
+                    f"Name-based matching is ambiguous for these; resolve rules by ID. "
+                    f"Most duplicated: {', '.join(f'{n} x{c}' for n, c in worst)}"
+                )
             self._remote_rules_cache = all_rules
             self._remote_rules_raw_cache = all_rules_raw
+            self._remote_rules_by_id = all_rules_by_id
             return all_rules
 
         except Exception as e:
             logger.error(f"Failed to fetch deployed rules: {e}")
             self._remote_rules_cache = {}
             self._remote_rules_raw_cache = {}
+            self._remote_rules_by_id = {}
             return {}
+
+    def get_remote_rules_by_id(self) -> Dict[str, Dict[str, Any]]:
+        """Get raw API data for all remote rules, keyed by rule_id.
+
+        Unlike the name-keyed cache this index is complete: CrowdStrike allows
+        duplicate rule names, so the name index silently drops every rule but the
+        last of each name. Anything matching on identity must use this.
+        """
+        if self._remote_rules_by_id is None:
+            self._fetch_all_remote_rules()
+        return self._remote_rules_by_id or {}
 
     def get_raw_remote_rules(self) -> Dict[str, Dict[str, Any]]:
         """Get raw (un-normalized) API data for all remote rules.
@@ -612,11 +656,15 @@ class DetectionProvider(BaseResourceProvider):
         logger.info(f"Created rule '{template['name']}' with rule_id: {rule_id}")
         logger.debug(f"[DEBUG] Create response rule_id: {rule_info.get('rule_id')}, id: {rule_info.get('id')}")
 
+        verified = self._verify_applied(rule_id, template, "create")
+        self._refresh_cache_entry(verified)
+
         return {
             "rule_id": rule_id,  # PERMANENT identifier
-            "name": template["name"],
+            "name": verified.get("name", ""),
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "response": rule_info,
+            "verified": True,
+            "response": verified,
         }
 
     def _wait_for_rule_status(self, resource_id: str, expected_status: str, max_wait: int = 30) -> bool:
@@ -737,18 +785,89 @@ class DetectionProvider(BaseResourceProvider):
 
         logger.info(f"Updating rule '{template['name']}' using: {strategy.get_name()}")
 
-        # Execute deployment strategy
-        response = strategy.execute(self._prepare_patch_payload)
+        # Execute deployment strategy. Its response is deliberately discarded: a
+        # 200 only means the API accepted the request, which is exactly the signal
+        # that proved untrustworthy. The read-back below is the source of truth.
+        strategy.execute(self._prepare_patch_payload)
 
-        # Extract result metadata
-        rule_info = response["body"]["resources"][0]
+        # The API accepting a PATCH does not mean the PATCH changed anything.
+        # Read the rule back and prove it before calling this a success.
+        verified = self._verify_applied(resource_id, template, "update")
+        self._refresh_cache_entry(verified)
 
         return {
             "rule_id": resource_id,
-            "name": template["name"],
+            "name": verified.get("name", ""),
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            "response": rule_info,
+            "verified": True,
+            "response": verified,
         }
+
+    def fetch_remote_raw(self, resource_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch one rule's raw API representation by ID, bypassing the cache.
+
+        The bulk cache is keyed by rule *name* and is populated before a deploy,
+        so it cannot be used to confirm a write: it is both stale and, when two
+        rules share a name, pointing at the wrong object.
+        """
+        try:
+            response = self.falcon.command("entities_rules_get_v1", ids=[resource_id])
+            if response["status_code"] == 200 and response["body"].get("resources"):
+                return response["body"]["resources"][0]
+            logger.debug(f"Read-back for rule {resource_id} returned no resources: {response.get('status_code')}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to read back rule {resource_id}: {e}")
+            return None
+
+    def _verify_applied(self, resource_id: str, template: Dict[str, Any], operation: str) -> Dict[str, Any]:
+        """Confirm the platform actually holds what we just wrote.
+
+        Re-reads the rule by ID and compares the canonical IaC-managed content
+        against the template - the same comparison `plan` and `drift` use. Polls
+        with backoff because the API is eventually consistent.
+
+        Returns:
+            The raw API rule, once it matches the template.
+
+        Raises:
+            RuntimeError: If the platform never converges on the template. A write
+                that does not land MUST fail loudly: reporting success here is what
+                let a rename silently no-op for two months while state recorded it
+                as deployed.
+        """
+        expected = self._canonical_content(template)
+        actual = None
+
+        for attempt, wait in enumerate([0.0] + list(VERIFY_BACKOFF)):
+            if wait:
+                time.sleep(wait)
+
+            raw = self.fetch_remote_raw(resource_id)
+            if raw is None:
+                logger.debug(f"Read-back attempt {attempt + 1} for {resource_id}: rule not returned")
+                continue
+
+            actual = self._canonical_content(raw)
+            if actual == expected:
+                if attempt:
+                    logger.debug(f"Read-back for {resource_id} converged after {attempt + 1} attempts")
+                return raw
+
+        if actual is None:
+            raise RuntimeError(
+                f"Verification failed after {operation} of rule '{template.get('name')}' "
+                f"(ID: {resource_id}): the rule could not be read back from CrowdStrike. "
+                f"The deployment cannot be confirmed and has NOT been recorded as successful."
+            )
+
+        diverged = sorted(k for k in set(expected) | set(actual) if expected.get(k) != actual.get(k))
+        details = "; ".join(f"{k}: sent {expected.get(k)!r}, platform holds {actual.get(k)!r}" for k in diverged)
+        raise RuntimeError(
+            f"Verification failed after {operation} of rule '{template.get('name')}' "
+            f"(ID: {resource_id}): the CrowdStrike API accepted the request but the rule "
+            f"still differs on {diverged}. {details}"
+        )
 
     def apply_delete(self, resource_id: str) -> Dict[str, Any]:
         """
@@ -847,16 +966,19 @@ class DetectionProvider(BaseResourceProvider):
         Prepare API payload from template for PATCH (update) operations
 
         IMPORTANT: PATCH has different requirements than POST:
-        - Cannot update 'name' field (immutable - would need separate rename operation)
         - Must include 'id' field
-        - Only mutable fields are accepted
         - Payload must be wrapped in an ARRAY when calling the API
+
+        'name' MUST be included. It is part of CONTENT_FIELDS, so a rename makes
+        compute_content_hash differ and `plan` reports an update. Omitting it here
+        made that update a silent no-op that still reported success.
 
         This method creates a payload suitable for entities_rules_patch_v1 endpoint.
         """
         # v0.3.0: single source of truth for reserved/internal key stripping.
         template = strip_for_api(template)
         payload = {
+            "name": template["name"],
             "description": template.get("description", ""),
             "severity": template.get("severity", 50),
             "status": template.get("status", "active"),
@@ -933,6 +1055,16 @@ class DetectionProvider(BaseResourceProvider):
         Works on both template data and raw API response data by
         extracting the same canonical set of fields from either format.
         """
+        content_str = json.dumps(self._canonical_content(template), sort_keys=True)
+        return hashlib.sha256(content_str.encode()).hexdigest()
+
+    def _canonical_content(self, template: Dict[str, Any]) -> Dict[str, Any]:
+        """Reduce a template or raw API rule to the canonical IaC-managed content.
+
+        This is the single definition of "what talonctl controls" — compute_content_hash
+        hashes it, and post-apply verification diffs it. Sharing one definition keeps
+        the verifier's verdict identical to the hash comparison plan and drift use.
+        """
         # v0.3.0: strip universal IaC-only + internal fields first for consistency
         # with other providers. The allowlist build below is the effective filter,
         # but this call locks in the single-source-of-truth for reserved keys.
@@ -976,9 +1108,7 @@ class DetectionProvider(BaseResourceProvider):
         # We normalize both to sorted list of "tactic_id:technique_id" strings.
         normalized_content["mitre_attack"] = self._normalize_mitre_for_hash(template.get("mitre_attack") or [])
 
-        # Calculate hash
-        content_str = json.dumps(normalized_content, sort_keys=True)
-        return hashlib.sha256(content_str.encode()).hexdigest()
+        return normalized_content
 
     @staticmethod
     def _normalize_mitre_for_hash(mitre_attack: list) -> list:
@@ -1064,10 +1194,45 @@ class DetectionProvider(BaseResourceProvider):
 
         return dependencies
 
+    def _refresh_cache_entry(self, raw_rule: Dict[str, Any]) -> None:
+        """Update the bulk caches in place for one rule we just wrote.
+
+        Keeps the cache honest after an apply without paying for a full re-fetch.
+        Because the caches are keyed by name, a rename leaves the rule filed under
+        its old key — that stale entry is removed by rule_id so a later lookup
+        cannot resolve to a name the platform no longer uses.
+        """
+        if self._remote_rules_cache is None or self._remote_rules_raw_cache is None:
+            return
+
+        if self._remote_rules_by_id is not None:
+            refreshed_id = raw_rule.get("rule_id") or raw_rule.get("id")
+            if refreshed_id:
+                self._remote_rules_by_id[refreshed_id] = raw_rule
+
+        name = raw_rule.get("name", "")
+        if not name:
+            return
+
+        rule_id = raw_rule.get("rule_id") or raw_rule.get("id")
+        if rule_id:
+            for cache in (self._remote_rules_cache, self._remote_rules_raw_cache):
+                stale = [
+                    key
+                    for key, value in cache.items()
+                    if key != name and (value.get("rule_id") or value.get("id")) == rule_id
+                ]
+                for key in stale:
+                    del cache[key]
+
+        self._remote_rules_raw_cache[name] = raw_rule
+        self._remote_rules_cache[name] = self._normalize_rule(raw_rule)
+
     def clear_cache(self):
         """Clear the remote rules cache"""
         self._remote_rules_cache = None
         self._remote_rules_raw_cache = None
+        self._remote_rules_by_id = None
 
     def publish(self, resource_ids: Optional[List[str]] = None) -> Tuple[List[str], List[Tuple[str, str]]]:
         """

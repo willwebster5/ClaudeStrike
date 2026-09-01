@@ -862,6 +862,40 @@ class TestDeploymentOrchestrator:
         assert resource is not None
         assert resource.id == "remote123"
 
+    def test_sync_records_the_permanent_rule_id_not_the_version_id(self, orchestrator):
+        """sync is the repair path for broken state, so it must persist rule_id.
+
+        CrowdStrike returns a per-version `id` alongside the permanent `rule_id`.
+        Persisting `id` produces a state entry that stops addressing the rule after
+        its next update — the defect that let updates target nothing for months.
+        """
+        template = DiscoveredTemplate(
+            resource_type="detection",
+            name="deployed_rule",
+            file_path=Path("rules/deployed.yaml"),
+            envelope=make_envelope({"resource_id": "deployed_rule", "name": "Deployed Rule"}, "detection"),
+            tags=[],
+            display_name="Deployed Rule",
+        )
+        orchestrator.template_discovery.discover_all.return_value = {"detection": [template]}
+
+        remote = {
+            "id": "01a0203670cf7ef4b92ec5585f8bb609",  # version ULID
+            "rule_id": "019c4d499c97767c9564d83fdaaf1ad5",  # permanent
+            "name": "Deployed Rule",
+            "severity": 50,
+        }
+
+        detection_provider = orchestrator.provider_adapter.providers["detection"]
+        detection_provider.compute_content_hash.return_value = "hash123"
+        detection_provider._fetch_all_remote_rules.return_value = {"Deployed Rule": remote}
+
+        orchestrator.sync()
+
+        resource = orchestrator.state_manager.get_resource("detection", "deployed_rule")
+        assert resource is not None
+        assert resource.id == "019c4d499c97767c9564d83fdaaf1ad5"
+
     def test_apply_stores_provider_uuid_in_state_not_iac_key(self, orchestrator):
         """End-to-end: after apply, state id is the real CrowdStrike UUID, not the IaC key."""
         from talonctl.core import ResourceAction
@@ -1081,10 +1115,25 @@ class TestOrchestratorEndToEndWithRealProviders:
         orchestrator = self._make_orchestrator(project)
 
         # Stub the Falcon uber-class create response the DetectionProvider expects.
-        orchestrator.falcon.command.return_value = {
-            "status_code": 201,
-            "body": {"resources": [{"rule_id": "rule-uuid-123", "id": "version-id-1"}]},
+        # The provider reads the rule back after creating it, so the stub must return
+        # a rule whose content matches the template — otherwise the create is (rightly)
+        # reported as unverified.
+        created_rule = {
+            "rule_id": "rule-uuid-123",
+            "id": "version-id-1",
+            "name": "Test Rule",
+            "description": "An end-to-end test detection rule.",
+            "severity": 50,
+            "status": "active",
+            "search": {},
         }
+
+        def command(op, **kwargs):
+            # POST answers 201; the verification GET answers 200, as the API does.
+            status = 201 if op == "entities_rules_post_v1" else 200
+            return {"status_code": status, "body": {"resources": [created_rule]}}
+
+        orchestrator.falcon.command.side_effect = command
 
         plan = orchestrator.plan(resource_types=["detection"], skip_query_validation=True)
         result = orchestrator.apply(plan, auto_approve=True)
@@ -1094,6 +1143,8 @@ class TestOrchestratorEndToEndWithRealProviders:
         # Real provider issued the create against the mocked Falcon client.
         called_cmds = [c.args[0] for c in orchestrator.falcon.command.call_args_list if c.args]
         assert "entities_rules_post_v1" in called_cmds
+        # ...and read it back to confirm the platform actually holds it.
+        assert "entities_rules_get_v1" in called_cmds
 
 
 if __name__ == "__main__":

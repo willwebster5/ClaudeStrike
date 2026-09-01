@@ -1,6 +1,7 @@
 """Shared CLI helpers for talonctl commands."""
 
 import os
+import sys
 import logging
 from pathlib import Path
 from typing import Optional
@@ -12,12 +13,28 @@ from talonctl.project import find_project_root
 
 # Rich console — shared by all commands
 disable_color = os.getenv("NO_COLOR") is not None or os.getenv("CI") is not None
-console = Console(
-    width=200 if os.getenv("CI") else None,
-    force_terminal=not disable_color,
-    no_color=disable_color,
-    force_jupyter=False,
-)
+
+
+def make_console(file=None) -> Console:
+    """Build the shared Rich console for a given destination.
+
+    force_terminal is only ever set for a real TTY. Forcing it unconditionally made
+    Rich emit terminal control sequences into redirected output, so `talonctl drift
+    > report.txt` captured a mangled fragment of the report instead of the report.
+    """
+    stream = file if file is not None else sys.stdout
+    is_tty = bool(getattr(stream, "isatty", lambda: False)())
+
+    return Console(
+        file=file,
+        width=200 if os.getenv("CI") else None,
+        force_terminal=(not disable_color) if is_tty else False,
+        no_color=disable_color,
+        force_jupyter=False,
+    )
+
+
+console = make_console()
 
 logger = logging.getLogger("talonctl")
 

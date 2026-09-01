@@ -205,17 +205,31 @@ class TestDetectionProvider:
         """Test creating a rule"""
         template = {"name": "New Rule", "description": "Test", "severity": 50, "search": {"query": "test query"}}
 
-        mock_falcon.command.return_value = {
-            "status_code": 201,
-            "body": {"resources": [{"rule_id": "new123", "name": "New Rule"}]},
+        # apply_create reads the rule back to prove the write landed, so the stub
+        # must answer both the POST and the verification GET.
+        created = {
+            "rule_id": "new123",
+            "name": "New Rule",
+            "description": "Test",
+            "severity": 50,
+            "status": "active",
+            "search": {},
         }
+
+        def command(op, **kwargs):
+            # POST answers 201; the verification GET answers 200, as the API does.
+            status = 201 if op == "entities_rules_post_v1" else 200
+            return {"status_code": status, "body": {"resources": [created]}}
+
+        mock_falcon.command.side_effect = command
 
         result = provider.apply_create(_env(template))
 
         assert result["rule_id"] == "new123"
         assert result["name"] == "New Rule"
         assert "created_at" in result
-        mock_falcon.command.assert_called_once()
+        called_cmds = [c.args[0] for c in mock_falcon.command.call_args_list if c.args]
+        assert called_cmds == ["entities_rules_post_v1", "entities_rules_get_v1"]
 
     def test_apply_update(self, provider, mock_falcon):
         """Test updating a rule"""
@@ -226,19 +240,26 @@ class TestDetectionProvider:
             "search": {"query": "new query"},
         }
 
-        mock_falcon.command.return_value = {
-            "status_code": 200,
-            "body": {"resources": [{"rule_id": "rule123", "name": "Updated Rule"}]},
+        # The stub answers the pre-fetch, the PATCH, and the verification read-back
+        # with the post-update rule.
+        updated = {
+            "rule_id": "rule123",
+            "name": "Updated Rule",
+            "description": "New description",
+            "severity": 70,
+            "status": "active",
+            "search": {},
         }
+        mock_falcon.command.return_value = {"status_code": 200, "body": {"resources": [updated]}}
 
         result = provider.apply_update("rule123", _env(template), {})
 
         assert result["rule_id"] == "rule123"
         assert result["name"] == "Updated Rule"
         assert "updated_at" in result
-        # apply_update calls fetch_remote_state first, then patches the rule
-        # Verify the last (patch) call was made
-        assert mock_falcon.command.call_count >= 2  # fetch_remote_state + patch
+        # fetch_remote_state, then patch, then the read-back that proves it landed.
+        called_cmds = [c.args[0] for c in mock_falcon.command.call_args_list if c.args]
+        assert called_cmds[-2:] == ["entities_rules_patch_v1", "entities_rules_get_v1"]
 
     def test_apply_delete(self, provider, mock_falcon):
         """Test deleting a rule"""
