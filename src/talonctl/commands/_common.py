@@ -12,7 +12,16 @@ from rich.console import Console
 from talonctl.project import find_project_root
 
 # Rich console — shared by all commands
-disable_color = os.getenv("NO_COLOR") is not None or os.getenv("CI") is not None
+
+
+def _color_disabled() -> bool:
+    """Whether colour output is suppressed, read at call time.
+
+    Read live rather than frozen at import so the console reflects the environment
+    it is actually built in — a module-level constant is fixed by whichever import
+    happens first, which is not necessarily under the caller's environment.
+    """
+    return os.getenv("NO_COLOR") is not None or os.getenv("CI") is not None
 
 
 def make_console(file=None) -> Console:
@@ -24,6 +33,7 @@ def make_console(file=None) -> Console:
     """
     stream = file if file is not None else sys.stdout
     is_tty = bool(getattr(stream, "isatty", lambda: False)())
+    disable_color = _color_disabled()
 
     return Console(
         file=file,
