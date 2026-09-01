@@ -222,3 +222,139 @@ def test_saved_search_drift_v2_sourced(tmp_path, drift):
         assert not report.has_drift
         assert report.in_sync_count == 1
         assert report.config_drift == []
+
+
+# --------------------------------------------------------------------------- #
+# Duplicate rule names (Defects 2 and 4)                                       #
+# --------------------------------------------------------------------------- #
+def test_drift_matches_tracked_rule_when_another_rule_shares_its_name():
+    """Drift must compare against the rule the state tracks, not a same-named stray.
+
+    CrowdStrike allows duplicate rule names, and the remote cache is keyed by name,
+    so the stray overwrote the tracked rule. Drift then diffed the template against
+    the wrong object and reported permanent, unfixable drift.
+    """
+    flat = _detection_flat()
+    env = make_envelope(flat, "detection", origin_path="/proj/detections/aws_root_login.yaml")
+    template = DiscoveredTemplate(
+        resource_type="detection",
+        name="aws_root_login",
+        file_path=Path("/proj/detections/aws_root_login.yaml"),
+        tags=[],
+        envelope=env,
+        display_name="AWS Root Login",
+    )
+
+    tracked = _detection_remote_raw(flat)
+    tracked["rule_id"] = "rid-tracked"
+    stray = _detection_remote_raw(flat, drift=True)
+    stray["rule_id"] = "rid-stray"
+
+    provider = DetectionProvider(MagicMock())
+    # The real fetch runs, so the name index keeps only the stray (last one wins)
+    # while the rule_id index keeps both.
+    provider.falcon.command = MagicMock(
+        return_value={
+            "status_code": 200,
+            "body": {"resources": [tracked, stray], "meta": {"pagination": {"total": 2}}},
+        }
+    )
+
+    detector = _build_detector(
+        provider=provider,
+        resource_type="detection",
+        templates=[template],
+        state_entries={"detection.aws_root_login": _make_state_entry("detection", "aws_root_login", "rid-tracked")},
+    )
+
+    report = detector.detect(resource_types=["detection"])
+
+    assert report.config_drift == [], "compared the template against a same-named stray rule"
+    assert report.in_sync_count == 1
+
+
+def test_drift_does_not_hide_rules_that_share_a_name():
+    """Every remote rule must be considered, not just the last of each name.
+
+    The name-keyed cache made collapsed duplicates invisible: they could never be
+    matched to a template, and never surfaced as orphans either.
+    """
+    flat = _detection_flat()
+    env = make_envelope(flat, "detection", origin_path="/proj/detections/aws_root_login.yaml")
+    template = DiscoveredTemplate(
+        resource_type="detection",
+        name="aws_root_login",
+        file_path=Path("/proj/detections/aws_root_login.yaml"),
+        tags=[],
+        envelope=env,
+        display_name="AWS Root Login",
+    )
+
+    tracked = _detection_remote_raw(flat)
+    tracked["rule_id"] = "rid-tracked"
+    stray = _detection_remote_raw(flat, drift=True)
+    stray["rule_id"] = "rid-stray"
+
+    provider = DetectionProvider(MagicMock())
+    provider.falcon.command = MagicMock(
+        return_value={
+            "status_code": 200,
+            "body": {"resources": [tracked, stray], "meta": {"pagination": {"total": 2}}},
+        }
+    )
+
+    detector = _build_detector(
+        provider=provider,
+        resource_type="detection",
+        templates=[template],
+        state_entries={"detection.aws_root_login": _make_state_entry("detection", "aws_root_login", "rid-tracked")},
+    )
+
+    report = detector.detect(resource_types=["detection"])
+
+    orphaned_ids = {item.resource_id for item in report.orphaned}
+    assert orphaned_ids == {"rid-stray"}, f"untracked duplicate not reported as an orphan: {orphaned_ids}"
+
+
+def test_stale_state_entries_are_still_reported_for_detections():
+    """Step 6 (stale state) must run for providers that expose a rule_id index.
+
+    A state entry whose rule exists in neither the templates nor the tenant is
+    stale and must be surfaced, whichever remote index drift matched against.
+    """
+    flat = _detection_flat()
+    env = make_envelope(flat, "detection", origin_path="/proj/detections/aws_root_login.yaml")
+    template = DiscoveredTemplate(
+        resource_type="detection",
+        name="aws_root_login",
+        file_path=Path("/proj/detections/aws_root_login.yaml"),
+        tags=[],
+        envelope=env,
+        display_name="AWS Root Login",
+    )
+
+    tracked = _detection_remote_raw(flat)
+    tracked["rule_id"] = "rid-detection-1"
+
+    provider = DetectionProvider(MagicMock())
+    provider.falcon.command = MagicMock(
+        return_value={
+            "status_code": 200,
+            "body": {"resources": [tracked], "meta": {"pagination": {"total": 1}}},
+        }
+    )
+
+    detector = _build_detector(
+        provider=provider,
+        resource_type="detection",
+        templates=[template],
+        state_entries={
+            "detection.aws_root_login": _make_state_entry("detection", "aws_root_login", "rid-detection-1"),
+            # Deployed once, since deleted from the tenant and from the templates.
+            "detection.retired_rule": _make_state_entry("detection", "retired_rule", "rid-gone"),
+        },
+    )
+
+    report = detector.detect(resource_types=["detection"])
+
+    assert [item.resource_id for item in report.stale_state] == ["retired_rule"]

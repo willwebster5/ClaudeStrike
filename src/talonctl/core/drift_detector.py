@@ -137,12 +137,24 @@ class DriftDetector:
         if hasattr(provider, "get_raw_remote_rules"):
             remote_raw = provider.get_raw_remote_rules()
 
-        # Build remote lookup by rule_id for reliable matching
+        # Build remote lookup by rule_id for reliable matching.
+        # Prefer the provider's complete rule_id index: `remote_resources` is keyed
+        # by name, and CrowdStrike names are not unique, so rules sharing a name
+        # overwrite each other there. Deriving identity from that index made
+        # collapsed duplicates invisible and matched templates to the wrong object.
         remote_by_rule_id = {}
-        for remote_name, remote_data in remote_resources.items():
-            rid = remote_data.get("rule_id", "")
-            if rid:
-                remote_by_rule_id[rid] = remote_data
+        has_id_index = False
+        provider_id_index = getattr(provider, "get_remote_rules_by_id", None)
+        if callable(provider_id_index):
+            candidate = provider_id_index()
+            if isinstance(candidate, dict):
+                remote_by_rule_id = candidate
+                has_id_index = True
+        if not has_id_index:
+            for remote_name, remote_data in remote_resources.items():
+                rid = remote_data.get("rule_id", "")
+                if rid:
+                    remote_by_rule_id[rid] = remote_data
 
         # 2. Get state entries for this type
         state_entries = self.state_manager.get_all_resources(resource_type)
@@ -172,6 +184,7 @@ class DriftDetector:
                 state_entry = state_by_name.get(display_name)
 
             remote_data = None
+            raw_data = None
 
             # Strategy 1: Match via rule_id from state entry (most reliable)
             if state_entry:
@@ -179,21 +192,24 @@ class DriftDetector:
                 state_rule_id = pm.get("rule_id", "") or state_entry.id
                 if state_rule_id and state_rule_id in remote_by_rule_id:
                     remote_data = remote_by_rule_id[state_rule_id]
+                    # The rule_id index holds raw API data; use it directly rather
+                    # than re-resolving by name, which is ambiguous.
+                    raw_data = remote_data
 
             # Strategy 2: Match via display_name (fallback)
             if not remote_data:
                 remote_data = remote_resources.get(display_name)
+                if remote_data:
+                    # Use raw API data for hash comparison (same structure as templates)
+                    # Fall back to normalized data for non-detection types
+                    remote_name = remote_data.get("name", "")
+                    raw_data = remote_raw.get(remote_name, remote_data) if remote_raw else remote_data
 
             if remote_data:
                 # Found remotely - track matched rule_id
                 rid = remote_data.get("rule_id", "")
                 if rid:
                     matched_remote_rule_ids.add(rid)
-
-                # Use raw API data for hash comparison (same structure as templates)
-                # Fall back to normalized data for non-detection types
-                remote_name = remote_data.get("name", "")
-                raw_data = remote_raw.get(remote_name, remote_data) if remote_raw else remote_data
 
                 # Compare hashes
                 remote_hash = provider.compute_content_hash(raw_data)
@@ -229,17 +245,31 @@ class DriftDetector:
                     # Not in state, not remote -> never deployed (not drift, skip)
                     logger.debug(f"Template {resource_id} not deployed and not in state - skipping")
 
-        # 5. Check for orphaned resources (remote but no template)
-        for remote_name, remote_data in remote_resources.items():
-            rid = remote_data.get("rule_id", "")
-            if rid and rid not in matched_remote_rule_ids:
-                report.orphaned.append(
-                    DriftItem(resource_type=resource_type, resource_id=remote_name, display_name=remote_name)
-                )
-            elif not rid and remote_name not in template_by_id and remote_name not in template_by_display:
-                report.orphaned.append(
-                    DriftItem(resource_type=resource_type, resource_id=remote_name, display_name=remote_name)
-                )
+        # 5. Check for orphaned resources (remote but no template).
+        # Walk the complete rule_id index where one exists, so duplicates that the
+        # name index dropped are still accounted for. Orphans are identified by
+        # rule_id because names are ambiguous — that is what makes them orphans.
+        if has_id_index:
+            for rid, raw in remote_by_rule_id.items():
+                if rid not in matched_remote_rule_ids:
+                    report.orphaned.append(
+                        DriftItem(
+                            resource_type=resource_type,
+                            resource_id=rid,
+                            display_name=raw.get("name", rid),
+                        )
+                    )
+        else:
+            for remote_name, remote_data in remote_resources.items():
+                rid = remote_data.get("rule_id", "")
+                if rid and rid not in matched_remote_rule_ids:
+                    report.orphaned.append(
+                        DriftItem(resource_type=resource_type, resource_id=remote_name, display_name=remote_name)
+                    )
+                elif not rid and remote_name not in template_by_id and remote_name not in template_by_display:
+                    report.orphaned.append(
+                        DriftItem(resource_type=resource_type, resource_id=remote_name, display_name=remote_name)
+                    )
 
         # 6. Check for stale state entries (in state, no template, no remote)
         remote_rule_ids = set(remote_by_rule_id.keys())

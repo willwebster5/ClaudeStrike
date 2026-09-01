@@ -10,7 +10,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 import logging
 
 from talonctl.core.resource_graph import ResourceGraph
@@ -522,13 +522,23 @@ class StateManager:
 
     @staticmethod
     def _backfill_state_data(data: Dict[str, Any]) -> Dict[str, Any]:
-        """Backfill missing fields in state data for backward compatibility.
+        """Reconcile a raw state entry with the current ResourceState schema.
 
         Older state entries may be missing fields that were added in later versions
-        (e.g., provider_metadata, display_name). This ensures ResourceState(**data)
-        always succeeds.
+        (e.g., provider_metadata, display_name), and may still carry fields that have
+        since been retired (e.g., last_deployed). Both directions must be handled so
+        ResourceState(**data) always succeeds: a retired key used to raise TypeError,
+        which drift caught per resource type and reported as an error, silently
+        skipping drift detection for that entire type.
         """
         data.setdefault("provider_metadata", {})
+
+        known = {f.name for f in fields(ResourceState)}
+        retired = set(data) - known
+        if retired:
+            logger.debug(f"Dropping retired state field(s) {sorted(retired)} from entry (schema drift)")
+            data = {k: v for k, v in data.items() if k in known}
+
         return data
 
     def get_resource(self, resource_type: str, resource_name: str) -> Optional[ResourceState]:

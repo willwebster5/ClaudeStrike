@@ -998,13 +998,21 @@ class DeploymentOrchestrator:
             deployed = self._fetch_all_deployed(provider, resource_type)
             stats["total_fetched"] += len(deployed)
 
-            # Build remote lookups: by rule_id and by name
+            # Build remote lookups: by rule_id and by name.
+            # Identity comes from the provider's complete rule_id index where one
+            # exists — `deployed` is keyed by name, and CrowdStrike names are not
+            # unique, so rules sharing a name overwrite each other there.
             remote_by_rule_id = {}
             remote_by_name = {}
+            provider_id_index = getattr(provider, "get_remote_rules_by_id", None)
+            if callable(provider_id_index):
+                candidate = provider_id_index()
+                if isinstance(candidate, dict):
+                    remote_by_rule_id = dict(candidate)
             for remote_name, remote_data in deployed.items():
                 rid = remote_data.get("rule_id", "")
                 if rid:
-                    remote_by_rule_id[rid] = remote_data
+                    remote_by_rule_id.setdefault(rid, remote_data)
                 remote_by_name[remote_name] = remote_data
 
             # Track which remote resources get matched (for unmatched reporting)
@@ -1060,7 +1068,9 @@ class DeploymentOrchestrator:
                     # Create ResourceState object
                     resource_state = ResourceState(
                         type=resource_type,
-                        id=remote_state.get("id", remote_state.get("rule_id", "")),
+                        # rule_id is permanent; `id` is a per-version ULID that stops
+                        # addressing the rule after its next update.
+                        id=StateSynchronizer.select_persisted_id(remote_state) or "",
                         content_hash=content_hash,
                         template_path=template_path,
                         deployed_at=datetime.now(timezone.utc).isoformat(),

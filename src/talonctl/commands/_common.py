@@ -1,6 +1,7 @@
 """Shared CLI helpers for talonctl commands."""
 
 import os
+import sys
 import logging
 from pathlib import Path
 from typing import Optional
@@ -11,13 +12,39 @@ from rich.console import Console
 from talonctl.project import find_project_root
 
 # Rich console — shared by all commands
-disable_color = os.getenv("NO_COLOR") is not None or os.getenv("CI") is not None
-console = Console(
-    width=200 if os.getenv("CI") else None,
-    force_terminal=not disable_color,
-    no_color=disable_color,
-    force_jupyter=False,
-)
+
+
+def _color_disabled() -> bool:
+    """Whether colour output is suppressed, read at call time.
+
+    Read live rather than frozen at import so the console reflects the environment
+    it is actually built in — a module-level constant is fixed by whichever import
+    happens first, which is not necessarily under the caller's environment.
+    """
+    return os.getenv("NO_COLOR") is not None or os.getenv("CI") is not None
+
+
+def make_console(file=None) -> Console:
+    """Build the shared Rich console for a given destination.
+
+    force_terminal is only ever set for a real TTY. Forcing it unconditionally made
+    Rich emit terminal control sequences into redirected output, so `talonctl drift
+    > report.txt` captured a mangled fragment of the report instead of the report.
+    """
+    stream = file if file is not None else sys.stdout
+    is_tty = bool(getattr(stream, "isatty", lambda: False)())
+    disable_color = _color_disabled()
+
+    return Console(
+        file=file,
+        width=200 if os.getenv("CI") else None,
+        force_terminal=(not disable_color) if is_tty else False,
+        no_color=disable_color,
+        force_jupyter=False,
+    )
+
+
+console = make_console()
 
 logger = logging.getLogger("talonctl")
 

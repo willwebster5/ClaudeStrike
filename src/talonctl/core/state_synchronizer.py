@@ -30,6 +30,21 @@ class StateSynchronizer:
     - Manage provider metadata for robust state tracking
     """
 
+    @staticmethod
+    def select_persisted_id(provider_result: dict) -> Optional[str]:
+        """Pick the identifier that is safe to persist in state.
+
+        CrowdStrike correlation rules carry three identifiers: `id` (a per-version
+        ULID that changes on every update), `rule_id` (the permanent ULID the
+        console addresses) and `executor_rule_id`. Only `rule_id` is stable, so it
+        wins wherever both are present — persisting `id` yields a state entry that
+        stops addressing the rule after its next update.
+
+        Providers that expose a single identifier (saved searches, dashboards, ...)
+        return only `id`, which stays correct via the fallback.
+        """
+        return provider_result.get("rule_id") or provider_result.get("id") or None
+
     def __init__(self, state_manager, provider_adapter):
         """
         Initialize state synchronizer.
@@ -87,7 +102,7 @@ class StateSynchronizer:
 
             # Fast path: use UUID directly from provider response (most reliable — no re-fetch needed)
             provider_result = (deploy_results or {}).get(resource_id, {})
-            fast_path_id = provider_result.get("id") or provider_result.get("rule_id")
+            fast_path_id = self.select_persisted_id(provider_result)
 
             if provider_result and not fast_path_id:
                 logger.warning(

@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+## v0.5.11b1 — beta: `apply` verifies its own writes
+
+Pre-release for validation against a live tenant. `pip install talonctl==0.5.11b1`.
+
+### Fixed
+
+- **`apply` no longer reports success for changes it did not make.** A rename was
+  planned, deployed, and reported as `✓ Deployed` while the platform object was
+  never modified; state then recorded the intended result as ground truth. Three
+  bugs stacked: `_prepare_patch_payload` omitted `name` (citing a rename operation
+  that does not exist in the codebase) even though `name` is in `CONTENT_FIELDS`,
+  so `plan` kept reporting an update the PATCH silently dropped; `apply` never
+  re-read the resource, so an accepted-but-inert PATCH was indistinguishable from
+  a successful one; and the remote cache was keyed by rule name, which CrowdStrike
+  does not keep unique. `apply_create`/`apply_update` now read the rule back by ID
+  and fail loudly, naming the diverging fields, when the platform does not converge
+  on the template.
+- **Duplicate rule names no longer hide rules.** The name-keyed cache collapsed
+  4926 remote rules into 680 entries in the affected tenant, so ID lookups missed
+  and name lookups resolved to the wrong object — which is why `drift` output was
+  byte-identical before and after a deploy. Added a complete `rule_id` index and
+  routed identity resolution in the provider, `drift`, and `sync` through it.
+  Shared names are now logged rather than silently collapsed.
+- **State records the permanent `rule_id`.** The state synchronizer preferred `id`
+  (a per-version ULID that changes on every update), producing entries that stop
+  addressing their rule. Both `apply` and `sync` now go through
+  `StateSynchronizer.select_persisted_id`.
+- **`drift` no longer skips a whole resource type on a legacy state key.**
+  `ResourceState(**data)` raised `TypeError` on retired fields, which `drift`
+  caught per type and reported as `✗ lookup_file: ...` — lookup_file drift was
+  never evaluated. Retired keys are dropped during backfill.
+- **Redirected output is plain text.** The shared console forced terminal mode
+  whenever colour was not explicitly disabled, so `talonctl drift > report.txt`
+  captured a mangled fragment. `force_terminal` is now set only for a real TTY,
+  and colour settings are read at call time rather than frozen at import.
+
+### Upgrade note
+
+Deployments that previously reported false success will now fail loudly. Expect the
+first run against a drifted tenant to surface real failures rather than silent
+no-ops. Sending `name` on PATCH is based on observed API behaviour (a description
+propagated from the same request that dropped the name) — verify against a
+throwaway rule before promoting this beta.
+
 ## v0.5.9 — hotfix: accept case management kinds in schema validator
 
 ### Fixed
