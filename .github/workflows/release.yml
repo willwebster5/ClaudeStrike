@@ -65,7 +65,7 @@ jobs:
             exit 1
           fi
           echo "Version verified: $TAG_VERSION"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
